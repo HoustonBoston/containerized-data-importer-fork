@@ -2373,6 +2373,12 @@ func CopyEvents(srcPVC, targetPVC client.Object, c client.Client, recorder recor
 		if _, exists := eventMap[formattedMsg]; exists {
 			continue
 		}
+
+		// simply check if event is a ClaimMisbound event, if so, skip it
+		if newEvent.Reason == "ClaimMisbound" {
+			continue
+		}
+
 		recorder.Event(targetPVC, newEvent.Type, newEvent.Reason, formattedMsg)
 	}
 }
