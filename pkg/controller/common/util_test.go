@@ -279,6 +279,60 @@ var _ = Describe("Rebind", func() {
 	})
 })
 
+var _ = Describe("CopyEvents", func() {
+	It("Should not copy ClaimMisbound events from srcPVC to targetPVC", func() {
+		pvcPrime := v1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pvcPrime",
+				Namespace: "default",
+				UID:       "prime-uid",
+			},
+		}
+		targetPVC := v1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "targetPVC",
+				Namespace: "default",
+				UID:       "target-uid",
+			},
+		}
+		claimMisboundEvent := v1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "claimMisboundEvent",
+				Namespace: "default",
+			},
+			Reason:  "ClaimMisbound",
+			Message: "Claim is misbound",
+			InvolvedObject: v1.ObjectReference{
+				Name: pvcPrime.Name,
+				UID:  pvcPrime.UID,
+			},
+			Type: v1.EventTypeWarning,
+		}
+		s := scheme.Scheme
+		cl := fake.NewClientBuilder().
+			WithScheme(s).
+			WithRuntimeObjects(&pvcPrime, &targetPVC, &claimMisboundEvent).
+			WithIndex(&v1.Event{}, "involvedObject.name", func(obj client.Object) []string {
+				return []string{obj.(*v1.Event).InvolvedObject.Name}
+			}).
+			WithIndex(&v1.Event{}, "involvedObject.uid", func(obj client.Object) []string {
+				return []string{string(obj.(*v1.Event).InvolvedObject.UID)}
+			}).
+			Build()
+
+		recorder := record.NewFakeRecorder(10)
+		CopyEvents(&pvcPrime, &targetPVC, cl, recorder)
+		// verify no ClaimMisbound event was recorded
+		close(recorder.Events)
+		for event := range recorder.Events {
+			println("Looking at event: ", event)
+			if strings.Contains(event, "ClaimMisbound") {
+				Fail("ClaimMisbound event was recorded")
+			}
+		}
+	})
+})
+
 var _ = Describe("GetMetricsURL", func() {
 	makePod := func(ip string, withMetrics bool) *v1.Pod {
 		pod := &v1.Pod{
@@ -411,149 +465,6 @@ var _ = Describe("sortEvents", func() {
 		Expect(events.Items[2].Message).To(Equal("[primeName] second prime"))
 		Expect(events.Items[3].Message).To(Equal("first"))
 		Expect(events.Items[4].Message).To(Equal("second"))
-	})
-})
-
-var _ = Describe("CopyEvents", func() {
-	var (
-		srcPVC    *v1.PersistentVolumeClaim
-		targetPVC *v1.PersistentVolumeClaim
-	)
-
-	BeforeEach(func() {
-		srcPVC = &v1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "prime-pvc",
-				Namespace: "default",
-				UID:       "src-uid",
-			},
-		}
-		targetPVC = &v1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "target-pvc",
-				Namespace: "default",
-				UID:       "target-uid",
-			},
-		}
-	})
-
-	It("Should copy events from srcPVC to targetPVC", func() {
-		event := v1.Event{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "event-1",
-				Namespace: "default",
-			},
-			InvolvedObject: v1.ObjectReference{
-				Name: srcPVC.Name,
-				UID:  srcPVC.UID,
-			},
-			Type:    v1.EventTypeNormal,
-			Reason:  "ImportSucceeded",
-			Message: "import done",
-		}
-		s := scheme.Scheme
-		cl := fake.NewClientBuilder().
-			WithScheme(s).
-			WithRuntimeObjects(srcPVC, targetPVC, &event).
-			WithIndex(&v1.Event{}, "involvedObject.name", func(obj client.Object) []string {
-				return []string{obj.(*v1.Event).InvolvedObject.Name}
-			}).
-			WithIndex(&v1.Event{}, "involvedObject.uid", func(obj client.Object) []string {
-				return []string{string(obj.(*v1.Event).InvolvedObject.UID)}
-			}).
-			Build()
-
-		rec := record.NewFakeRecorder(10)
-		CopyEvents(srcPVC, targetPVC, cl, rec)
-
-		close(rec.Events)
-		found := false
-		for e := range rec.Events {
-			if strings.Contains(e, "import done") {
-				found = true
-			}
-		}
-		Expect(found).To(BeTrue())
-	})
-
-	It("Should not copy events that already exist on targetPVC", func() {
-		existingMsg := "[prime-pvc] : import done"
-		event := v1.Event{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "event-src",
-				Namespace: "default",
-			},
-			InvolvedObject: v1.ObjectReference{
-				Name: srcPVC.Name,
-				UID:  srcPVC.UID,
-			},
-			Type:    v1.EventTypeNormal,
-			Reason:  "ImportSucceeded",
-			Message: "import done",
-		}
-		alreadyCopied := v1.Event{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "event-target",
-				Namespace: "default",
-			},
-			InvolvedObject: v1.ObjectReference{
-				Name: targetPVC.Name,
-				UID:  targetPVC.UID,
-			},
-			Type:    v1.EventTypeNormal,
-			Reason:  "ImportSucceeded",
-			Message: existingMsg,
-		}
-		s := scheme.Scheme
-		cl := fake.NewClientBuilder().
-			WithScheme(s).
-			WithRuntimeObjects(srcPVC, targetPVC, &event, &alreadyCopied).
-			WithIndex(&v1.Event{}, "involvedObject.name", func(obj client.Object) []string {
-				return []string{obj.(*v1.Event).InvolvedObject.Name}
-			}).
-			WithIndex(&v1.Event{}, "involvedObject.uid", func(obj client.Object) []string {
-				return []string{string(obj.(*v1.Event).InvolvedObject.UID)}
-			}).
-			Build()
-
-		rec := record.NewFakeRecorder(10)
-		CopyEvents(srcPVC, targetPVC, cl, rec)
-
-		close(rec.Events)
-		Expect(rec.Events).To(BeEmpty())
-	})
-
-	It("Should not copy ClaimMisbound events from srcPVC to targetPVC", func() {
-		claimMisboundEvent := v1.Event{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "misbound-event",
-				Namespace: "default",
-			},
-			InvolvedObject: v1.ObjectReference{
-				Name: srcPVC.Name,
-				UID:  srcPVC.UID,
-			},
-			Type:    v1.EventTypeWarning,
-			Reason:  "ClaimMisbound",
-			Message: "claim is misbound",
-		}
-		s := scheme.Scheme
-		cl := fake.NewClientBuilder().
-			WithScheme(s).
-			WithRuntimeObjects(srcPVC, targetPVC, &claimMisboundEvent).
-			WithIndex(&v1.Event{}, "involvedObject.name", func(obj client.Object) []string {
-				return []string{obj.(*v1.Event).InvolvedObject.Name}
-			}).
-			WithIndex(&v1.Event{}, "involvedObject.uid", func(obj client.Object) []string {
-				return []string{string(obj.(*v1.Event).InvolvedObject.UID)}
-			}).
-			Build()
-
-		rec := record.NewFakeRecorder(10)
-		CopyEvents(srcPVC, targetPVC, cl, rec)
-
-		close(rec.Events)
-		Expect(rec.Events).To(BeEmpty())
 	})
 })
 
