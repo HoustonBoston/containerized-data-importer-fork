@@ -712,8 +712,8 @@ type NbdOperations interface {
 
 // BlockStatusData holds zero/hole status for one block of data
 type BlockStatusData struct {
-	Offset int64
-	Length int64
+	Offset uint64
+	Length uint64
 	Flags  uint32
 }
 
@@ -730,11 +730,7 @@ func GetBlockStatus(handle NbdOperations, extent types.DiskChangeExtent) []*Bloc
 
 	// Callback for libnbd.BlockStatus. Needs to modify blocks list above.
 	updateBlocksCallback := func(metacontext string, nbdOffset uint64, extents []uint32, err *int) int {
-		if nbdOffset > math.MaxInt64 {
-			klog.Errorf("Block status offset too big for conversion: 0x%x", nbdOffset)
-			return -2
-		}
-		offset := int64(nbdOffset)
+		offset := nbdOffset
 
 		if *err != 0 {
 			klog.Errorf("Block status callback error at offset %d: error code %d", offset, *err)
@@ -749,7 +745,11 @@ func GetBlockStatus(handle NbdOperations, extent types.DiskChangeExtent) []*Bloc
 			return -1
 		}
 		for i := 0; i < len(extents); i += 2 {
-			length, flags := int64(extents[i]), extents[i+1]
+			length, flags := uint64(extents[i]), extents[i+1]
+			if offset > math.MaxInt64 {
+				klog.Errorf("Block status offset too big for conversion: 0x%x", offset)
+				return -2
+			}
 			if blocks != nil {
 				last := len(blocks) - 1
 				lastBlock := blocks[last]
@@ -774,33 +774,47 @@ func GetBlockStatus(handle NbdOperations, extent types.DiskChangeExtent) []*Bloc
 	}
 
 	if extent.Length < 1024*1024 {
+		if extent.Start < 0 || extent.Length < 0 {
+			return nil
+		}
 		blocks = append(blocks, &BlockStatusData{
-			Offset: extent.Start,
-			Length: extent.Length,
+			Offset: uint64(extent.Start),
+			Length: uint64(extent.Length),
 			Flags:  0})
 		return blocks
 	}
 
-	lastOffset := extent.Start
-	endOffset := extent.Start + extent.Length
+	if extent.Start < 0 || extent.Length < 0 {
+		return nil
+	}
+	lastOffset := uint64(extent.Start)
+	endOffset := lastOffset + uint64(extent.Length)
 	for lastOffset < endOffset {
-		var length int64
 		missingLength := endOffset - lastOffset
-		if missingLength > (MaxBlockStatusLength) {
+		var length uint64
+		if missingLength > MaxBlockStatusLength {
 			length = MaxBlockStatusLength
 		} else {
 			length = missingLength
 		}
 		createWholeBlock := func() []*BlockStatusData {
+			start := uint64(0)
+			length := uint64(0)
+			if extent.Start >= 0 {
+				start = uint64(extent.Start)
+			}
+			if extent.Length >= 0 {
+				length = uint64(extent.Length)
+			}
 			block := &BlockStatusData{
-				Offset: extent.Start,
-				Length: extent.Length,
+				Offset: start,
+				Length: length,
 				Flags:  0,
 			}
 			blocks = []*BlockStatusData{block}
 			return blocks
 		}
-		err := handle.BlockStatus(uint64(length), uint64(lastOffset), updateBlocksCallback, &fixedOptArgs)
+		err := handle.BlockStatus(length, lastOffset, updateBlocksCallback, &fixedOptArgs)
 		if err != nil {
 			klog.Errorf("Error getting block status at offset %d, returning whole block instead. Error was: %v", lastOffset, err)
 			return createWholeBlock()
@@ -830,36 +844,45 @@ func CopyRange(handle NbdOperations, sink VDDKDataSink, block *BlockStatusData, 
 		skip += "zero block"
 	}
 
-	if (block.Flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 {
-		klog.Infof("Found a %d-byte %s at offset %d, filling destination with zeroes.", block.Length, skip, block.Offset)
-		err := sink.ZeroRange(block.Offset, block.Length)
-		updateProgress(int(block.Length))
-		return err
+	if block.Offset > math.MaxInt64 || block.Length > math.MaxInt64 {
+		return fmt.Errorf("block offset %d or length %d exceeds int64", block.Offset, block.Length)
+	}
+
+	if block.Offset <= math.MaxInt64 && block.Length <= math.MaxInt64 {
+		if (block.Flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 {
+			klog.Infof("Found a %d-byte %s at offset %d, filling destination with zeroes.", block.Length, skip, block.Offset)
+			err := sink.ZeroRange(int64(block.Offset), int64(block.Length))
+			updateProgress(int(block.Length))
+			return err
+		}
 	}
 
 	buffer := bytes.Repeat([]byte{0}, MaxPreadLength)
-	count := int64(0)
+	count := uint64(0)
 	for count < block.Length {
-		if block.Length-count < int64(MaxPreadLength) {
-			buffer = bytes.Repeat([]byte{0}, int(block.Length-count))
+		remaining := block.Length - count
+		if MaxPreadLength >= 0 && remaining < uint64(MaxPreadLength) {
+			if remaining <= math.MaxInt {
+				buffer = bytes.Repeat([]byte{0}, int(remaining))
+			}
 		}
 		length := len(buffer)
 
 		offset := block.Offset + count
-		err := handle.Pread(buffer, uint64(offset), nil)
+		err := handle.Pread(buffer, offset, nil)
 		if err != nil {
 			klog.Errorf("Error reading from source at offset %d: %v", offset, err)
 			return err
 		}
 
-		written, err := sink.Pwrite(buffer, uint64(offset))
+		written, err := sink.Pwrite(buffer, offset)
 		if err != nil {
 			klog.Errorf("Failed to write data block at offset %d to local file: %v", block.Offset, err)
 			return err
 		}
 
 		updateProgress(written)
-		count += int64(length)
+		count += uint64(length)
 	}
 	return nil
 }
@@ -905,7 +928,14 @@ func createVddkDataSink(destinationFile string, size uint64, volumeMode v1.Persi
 
 // Pwrite writes the given byte buffer to the sink at the given offset
 func (sink *VDDKFileSink) Pwrite(buffer []byte, offset uint64) (int, error) {
-	written, err := syscall.Pwrite(int(sink.file.Fd()), buffer, int64(offset))
+	if offset > math.MaxInt64 {
+		return 0, fmt.Errorf("write offset %d exceeds int64", offset)
+	}
+	var written int
+	var err error
+	if offset <= math.MaxInt64 {
+		written, err = syscall.Pwrite(int(sink.file.Fd()), buffer, int64(offset))
+	}
 	blocksize := len(buffer)
 	if written < blocksize {
 		klog.Infof("Wrote less than blocksize (%d): %d", blocksize, written)
@@ -957,10 +987,16 @@ func (sink *VDDKFileSink) ZeroRange(offset int64, length int64) error {
 		count := int64(0)
 		const blocksize = 16 << 20
 		buffer := bytes.Repeat([]byte{0}, blocksize)
+		if offset < 0 {
+			return errors.New("negative offset in ZeroRange fallback")
+		}
 		for count < length {
 			remaining := length - count
-			if remaining < blocksize {
+			if remaining < blocksize && remaining >= 0 {
 				buffer = bytes.Repeat([]byte{0}, int(remaining))
+			}
+			if offset < 0 {
+				return errors.New("negative offset in ZeroRange pwrite")
 			}
 			written, err := sink.Pwrite(buffer, uint64(offset))
 			if err != nil {
@@ -1177,7 +1213,9 @@ func (vs *VDDKDataSource) TransferFile(fileName string, preallocation bool) (Pro
 	initialProgressTime := time.Now()
 	updateProgress := func(written int) {
 		// Only log progress at approximately 1% minimum intervals.
-		currentProgressBytes += uint64(written)
+		if written > 0 {
+			currentProgressBytes += uint64(written)
+		}
 		currentProgressPercent := uint(100.0 * (float64(currentProgressBytes) / float64(vs.Size)))
 		if currentProgressPercent > previousProgressPercent {
 			progressMessage := fmt.Sprintf("Transferred %d/%d bytes (%d%%)", currentProgressBytes, vs.Size, currentProgressPercent)
@@ -1353,16 +1391,25 @@ func (vs *VDDKDataSource) TransferFile(fileName string, preallocation bool) (Pro
 			}
 		}
 	} else { // Cold migration full copy
+		if vs.Size > math.MaxInt64 {
+			return ProcessingPhaseError, fmt.Errorf("disk size %d exceeds int64", vs.Size)
+		}
 		start := uint64(0)
 		blocksize := uint64(MaxBlockStatusLength)
 		for i := start; i < vs.Size; i += blocksize {
 			if (vs.Size - i) < blocksize {
 				blocksize = vs.Size - i
 			}
+			if i > math.MaxInt64 || blocksize > math.MaxInt64 {
+				return ProcessingPhaseError, fmt.Errorf("block offset %d or size %d exceeds int64", i, blocksize)
+			}
 
-			extent := types.DiskChangeExtent{
-				Length: int64(blocksize),
-				Start:  int64(i),
+			var extent types.DiskChangeExtent
+			if i <= math.MaxInt64 && blocksize <= math.MaxInt64 {
+				extent = types.DiskChangeExtent{
+					Length: int64(blocksize),
+					Start:  int64(i),
+				}
 			}
 
 			blocks := GetBlockStatus(vs.NbdKit.Handle, extent)
